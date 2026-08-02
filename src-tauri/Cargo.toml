@@ -1,0 +1,54 @@
+[package]
+name = "voicel"
+version = "0.1.0"
+description = "Local real-time dictation for Windows"
+authors = ["Voicel contributors"]
+edition = "2024"
+license = "MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "voicel_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+anyhow = "1"
+cpal = "0.16"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+enigo = "0.6.1"
+futures-util = "0.3"
+log = "0.4"
+parking_lot = "0.12"
+reqwest = { version = "0.12", features = ["stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sherpa-onnx = "1.13.4"
+tauri = { version = "2.11.5", features = ["tray-icon", "image-png"] }
+tauri-plugin-autostart = "2.5.1"
+tauri-plugin-clipboard-manager = "2.3.2"
+tauri-plugin-global-shortcut = "2.3.1"
+tauri-plugin-log = "2.7.1"
+tauri-plugin-opener = "2.5.2"
+tauri-plugin-single-instance = "2.3.2"
+tar = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+bzip2 = "0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61.3", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Gdi",
+  "Win32_System_DataExchange",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }
