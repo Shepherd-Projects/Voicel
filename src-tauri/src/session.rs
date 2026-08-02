@@ -15,6 +15,7 @@ use crate::models::ModelSpec;
 use crate::settings::{InsertionMethod, Settings};
 
 pub const TRANSCRIPT_REVISION_EVENT: &str = "transcript-revision";
+pub const SESSION_PHASE_EVENT: &str = "session-phase";
 pub const OVERLAY_WINDOW_LABEL: &str = "overlay";
 
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(40);
@@ -30,6 +31,12 @@ pub struct TranscriptRevisionEvent {
     pub is_final: bool,
     pub elapsed_ms: u64,
     pub input_level: f32,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPhaseEvent {
+    pub phase: AppPhase,
 }
 
 #[derive(Default)]
@@ -124,7 +131,6 @@ struct SessionSettings {
 }
 
 struct PreparedSession {
-    target_window: ForegroundWindow,
     engine: SpeechEngine,
     capture: AudioCapture,
     audio_receiver: Receiver<AudioChunk>,
@@ -200,60 +206,32 @@ pub fn start_session(
 ) -> Result<(), String> {
     let reservation = sessions.reserve()?;
     reset_for_start(state);
-
-    let prepared = match prepare_session(state) {
-        Ok(prepared) => prepared,
+    let target_window = match current_foreground_window() {
+        Ok(target_window) => target_window,
         Err(error) => return fail_to_start(state, sessions, reservation.id, error),
     };
-
-    set_phase(state, AppPhase::Recording);
     if let Err(error) = show_overlay(&app) {
-        drop(prepared);
         return fail_to_start(state, sessions, reservation.id, error);
     }
-
-    let initial_progress = TranscriptProgress::default();
-    if let Err(error) = publish_progress(&app, state, &initial_progress, false) {
+    if let Err(error) = publish_phase(&app, state, AppPhase::Loading) {
         let _ = hide_overlay(&app);
-        drop(prepared);
+        let _ = restore_target_focus(target_window);
         return fail_to_start(state, sessions, reservation.id, error);
     }
 
     let session_id = reservation.id;
     let control_receiver = reservation.control_receiver;
-    let PreparedSession {
-        target_window,
-        engine,
-        capture,
-        audio_receiver,
-        settings,
-    } = prepared;
     let worker_app = app.clone();
     let spawn_result = thread::Builder::new()
-        .name("voicel-recording".to_owned())
+        .name("voicel-session".to_owned())
         .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_worker(
-                    worker_app.clone(),
-                    target_window,
-                    engine,
-                    capture,
-                    audio_receiver,
-                    control_receiver,
-                    settings,
-                );
-            }));
-            if result.is_err() {
-                let state = worker_app.state::<AppState>();
-                let _ = hide_overlay(&worker_app);
-                let _ = restore_target_focus(target_window);
-                expose_error(&state, "Recording session stopped unexpectedly".to_owned());
-            }
+            run_session_worker(worker_app.clone(), target_window, control_receiver);
             worker_app.state::<SessionManager>().clear(session_id);
         });
 
     if let Err(error) = spawn_result {
         let _ = hide_overlay(&app);
+        let _ = restore_target_focus(target_window);
         return fail_to_start(
             state,
             sessions,
@@ -273,8 +251,91 @@ pub fn cancel_session(sessions: &SessionManager) -> Result<(), String> {
     sessions.send_control(SessionCommand::Cancel)
 }
 
+fn run_session_worker(
+    app: AppHandle,
+    target_window: ForegroundWindow,
+    control_receiver: Receiver<SessionCommand>,
+) {
+    let state = app.state::<AppState>();
+    let preparation =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare_session(&state)));
+    let prepared = match preparation {
+        Ok(Ok(prepared)) => prepared,
+        Ok(Err(error)) => {
+            fail_worker_start(&app, &state, target_window, error);
+            return;
+        }
+        Err(_) => {
+            fail_worker_start(
+                &app,
+                &state,
+                target_window,
+                "Speech model initialization stopped unexpectedly".to_owned(),
+            );
+            return;
+        }
+    };
+
+    match control_receiver.try_recv() {
+        Ok(SessionCommand::Stop | SessionCommand::Cancel) => {
+            let PreparedSession {
+                engine, capture, ..
+            } = prepared;
+            drop(capture);
+            engine.unload();
+            finish_cancel(&app, &state, target_window);
+            return;
+        }
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => {
+            drop(prepared);
+            fail_worker_start(
+                &app,
+                &state,
+                target_window,
+                "Recording control channel closed while loading".to_owned(),
+            );
+            return;
+        }
+    }
+
+    if let Err(error) = publish_phase(&app, &state, AppPhase::Recording) {
+        drop(prepared);
+        fail_worker_start(&app, &state, target_window, error);
+        return;
+    }
+    if let Err(error) = publish_progress(&app, &state, &TranscriptProgress::default(), false) {
+        drop(prepared);
+        fail_worker_start(&app, &state, target_window, error);
+        return;
+    }
+
+    let PreparedSession {
+        engine,
+        capture,
+        audio_receiver,
+        settings,
+        ..
+    } = prepared;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_worker(
+            app.clone(),
+            target_window,
+            engine,
+            capture,
+            audio_receiver,
+            control_receiver,
+            settings,
+        );
+    }));
+    if result.is_err() {
+        let _ = hide_overlay(&app);
+        let _ = restore_target_focus(target_window);
+        expose_error(&state, "Recording session stopped unexpectedly".to_owned());
+    }
+}
+
 fn prepare_session(state: &AppState) -> Result<PreparedSession, String> {
-    let target_window = current_foreground_window()?;
     let settings = state.settings.lock().clone();
     let spec = state
         .model_store
@@ -291,12 +352,27 @@ fn prepare_session(state: &AppState) -> Result<PreparedSession, String> {
         AudioCapture::start().map_err(|error| format!("Start microphone capture: {error}"))?;
 
     Ok(PreparedSession {
-        target_window,
         engine,
         capture,
         audio_receiver,
         settings: session_settings(spec, &settings),
     })
+}
+
+fn fail_worker_start(
+    app: &AppHandle,
+    state: &AppState,
+    target_window: ForegroundWindow,
+    error: String,
+) {
+    let mut errors = vec![error];
+    if let Err(error) = hide_overlay(app) {
+        errors.push(error);
+    }
+    if let Err(error) = restore_target_focus(target_window) {
+        errors.push(error);
+    }
+    expose_error(state, errors.join("; "));
 }
 
 fn session_settings(spec: &ModelSpec, settings: &Settings) -> SessionSettings {
@@ -595,6 +671,12 @@ fn publish_progress(
     .map_err(|error| format!("Emit transcript revision: {error}"))
 }
 
+fn publish_phase(app: &AppHandle, state: &AppState, phase: AppPhase) -> Result<(), String> {
+    set_phase(state, phase);
+    app.emit(SESSION_PHASE_EVENT, SessionPhaseEvent { phase })
+        .map_err(|error| format!("Emit session phase: {error}"))
+}
+
 fn reset_for_start(state: &AppState) {
     set_phase(state, AppPhase::Loading);
     *state.transcript.lock() = TranscriptState::default();
@@ -774,6 +856,17 @@ mod tests {
                 "elapsedMs": 1250,
                 "inputLevel": 0.4_f32,
             })
+        );
+    }
+
+    #[test]
+    fn phase_event_serialization_matches_frontend_contract() {
+        assert_eq!(
+            serde_json::to_value(SessionPhaseEvent {
+                phase: AppPhase::Loading,
+            })
+            .expect("serialize phase event"),
+            json!({ "phase": "loading" })
         );
     }
 

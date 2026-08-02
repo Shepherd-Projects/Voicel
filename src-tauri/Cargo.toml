@@ -1,6 +1,6 @@
 [package]
 name = "voicel"
-version = "0.1.2"
+version = "0.1.3"
 description = "Local real-time dictation for Windows"
 authors = ["Voicel contributors"]
 edition = "2024"

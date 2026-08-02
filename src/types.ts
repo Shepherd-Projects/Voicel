@@ -52,3 +52,7 @@ export interface TranscriptRevision {
   elapsedMs: number;
   inputLevel: number;
 }
+
+export interface SessionPhaseEvent {
+  phase: AppPhase;
+}

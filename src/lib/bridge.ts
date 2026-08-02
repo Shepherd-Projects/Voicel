@@ -1,7 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { AppSnapshot, Settings, TranscriptRevision } from "../types";
+import type {
+  AppSnapshot,
+  SessionPhaseEvent,
+  Settings,
+  TranscriptRevision,
+} from "../types";
 
 export const isDesktopRuntime = "__TAURI_INTERNALS__" in window;
 
@@ -64,6 +69,7 @@ const preview: AppSnapshot = {
 let timer: number | undefined;
 let revision = 0;
 const listeners = new Set<(value: TranscriptRevision) => void>();
+const phaseListeners = new Set<(value: SessionPhaseEvent) => void>();
 const previewWords =
   "This is genuine streaming text arriving while you speak, so a long thought never turns into a long wait at the end.".split(
     " ",
@@ -89,6 +95,10 @@ const desktopBridge = {
     listen<TranscriptRevision>("transcript-revision", (event) =>
       listener(event.payload),
     ),
+  onSessionPhase: (listener: (value: SessionPhaseEvent) => void) =>
+    listen<SessionPhaseEvent>("session-phase", (event) =>
+      listener(event.payload),
+    ),
   minimize: () => getCurrentWindow().minimize(),
   hide: () => getCurrentWindow().hide(),
 };
@@ -97,7 +107,10 @@ const previewBridge = {
   snapshot: async () => structuredClone(preview),
   start: async () => {
     window.clearInterval(timer);
+    preview.phase = "loading";
+    phaseListeners.forEach((listener) => listener({ phase: "loading" }));
     preview.phase = "recording";
+    phaseListeners.forEach((listener) => listener({ phase: "recording" }));
     preview.stableText = "";
     preview.revisingText = "";
     preview.elapsedMs = 0;
@@ -169,6 +182,12 @@ const previewBridge = {
   ): Promise<UnlistenFn> => {
     listeners.add(listener);
     return () => listeners.delete(listener);
+  },
+  onSessionPhase: async (
+    listener: (value: SessionPhaseEvent) => void,
+  ): Promise<UnlistenFn> => {
+    phaseListeners.add(listener);
+    return () => phaseListeners.delete(listener);
   },
   minimize: async () => undefined,
   hide: async () => undefined,

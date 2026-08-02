@@ -28,6 +28,17 @@ body,
   background: #171a16;
   box-shadow: 0 14px 40px #0009;
 }
+.recording-overlay[data-phase="loading"] {
+  border-left-color: #c9f45b;
+}
+.recording-overlay[data-phase="loading"] .overlay-signal {
+  color: #c9f45b;
+  border-color: #46532f;
+  background: #1c2417;
+}
+.recording-overlay[data-phase="loading"] .overlay-copy b {
+  color: #c9f45b;
+}
 .overlay-signal {
   width: 42px;
   height: 42px;

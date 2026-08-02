@@ -45,6 +45,9 @@ pub enum EngineError {
     InvalidHotword {
         word: String,
     },
+    HotwordTokenFileReadFailed {
+        path: PathBuf,
+    },
     AlreadyFinalized,
 }
 
@@ -75,6 +78,13 @@ impl fmt::Display for EngineError {
             Self::InvalidHotword { word } => {
                 write!(formatter, "Hotword contains a NUL byte: {word:?}")
             }
+            Self::HotwordTokenFileReadFailed { path } => {
+                write!(
+                    formatter,
+                    "Could not read hotword tokens: {}",
+                    path.display()
+                )
+            }
             Self::AlreadyFinalized => formatter.write_str("Speech engine is already finalized"),
         }
     }
@@ -99,11 +109,10 @@ impl SpeechEngine {
         let corrector = WordCorrector::new(custom_words)?;
         let backend = match spec.engine {
             EngineKind::OnlineZipformer => {
-                Backend::Online(OnlineBackend::new(&files, spec.id, corrector.hotwords())?)
+                let hotwords = encode_hotwords(&files.tokens, custom_words)?;
+                Backend::Online(OnlineBackend::new(&files, spec.id, hotwords.as_deref())?)
             }
-            EngineKind::OfflineParakeet => {
-                Backend::Offline(OfflineBackend::new(&files, spec.id, corrector.hotwords())?)
-            }
+            EngineKind::OfflineParakeet => Backend::Offline(OfflineBackend::new(&files, spec.id)?),
         };
 
         Ok(Self {
@@ -250,7 +259,13 @@ impl OnlineBackend {
         config.model_config.tokens = Some(path_string(&files.tokens));
         config.model_config.num_threads = 1;
         config.model_config.provider = Some("cpu".to_owned());
-        config.decoding_method = Some("greedy_search".to_owned());
+        config.decoding_method = Some(if hotwords.is_some() {
+            "modified_beam_search".to_owned()
+        } else {
+            "greedy_search".to_owned()
+        });
+        config.max_active_paths = 4;
+        config.hotwords_score = 1.5;
         config.enable_endpoint = true;
         config.rule1_min_trailing_silence = 2.4;
         config.rule2_min_trailing_silence = 1.2;
@@ -343,7 +358,6 @@ impl OnlineBackend {
 
 struct OfflineBackend {
     recognizer: OfflineRecognizer,
-    hotwords: Option<String>,
     model_id: String,
     buffer: Vec<f32>,
     next_preview_length: usize,
@@ -352,11 +366,7 @@ struct OfflineBackend {
 }
 
 impl OfflineBackend {
-    fn new(
-        files: &ModelFiles,
-        model_id: &str,
-        hotwords: Option<&str>,
-    ) -> Result<Self, EngineError> {
+    fn new(files: &ModelFiles, model_id: &str) -> Result<Self, EngineError> {
         let mut config = OfflineRecognizerConfig::default();
         config.model_config.transducer = OfflineTransducerModelConfig {
             encoder: Some(path_string(&files.encoder)),
@@ -378,7 +388,6 @@ impl OfflineBackend {
 
         Ok(Self {
             recognizer,
-            hotwords: hotwords.map(str::to_owned),
             model_id: model_id.to_owned(),
             buffer: Vec::new(),
             next_preview_length: PARAKEET_PREVIEW_CADENCE_SAMPLES,
@@ -442,10 +451,7 @@ impl OfflineBackend {
         samples: &[f32],
         corrector: &WordCorrector,
     ) -> Result<String, EngineError> {
-        let stream = match self.hotwords.as_deref() {
-            Some(hotwords) => self.recognizer.create_stream_with_hotwords(hotwords),
-            None => self.recognizer.create_stream(),
-        };
+        let stream = self.recognizer.create_stream();
         stream.accept_waveform(SAMPLE_RATE, samples);
         self.recognizer.decode(&stream);
         stream
@@ -476,6 +482,68 @@ fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+fn encode_hotwords(tokens_path: &Path, words: &[String]) -> Result<Option<String>, EngineError> {
+    if words.is_empty() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(tokens_path).map_err(|_| {
+        EngineError::HotwordTokenFileReadFailed {
+            path: tokens_path.to_owned(),
+        }
+    })?;
+    let symbols = contents
+        .lines()
+        .filter_map(|line| line.rsplit_once(char::is_whitespace))
+        .map(|(symbol, _)| symbol)
+        .filter(|symbol| !symbol.starts_with('<'))
+        .collect::<Vec<_>>();
+    Ok(encode_hotwords_from_symbols(&symbols, words))
+}
+
+fn encode_hotwords_from_symbols(symbols: &[&str], words: &[String]) -> Option<String> {
+    let mut symbols = symbols.to_vec();
+    symbols.sort_by_key(|symbol| std::cmp::Reverse(symbol.len()));
+
+    let encoded = words
+        .iter()
+        .filter_map(|phrase| {
+            phrase
+                .split_whitespace()
+                .map(|word| encode_hotword_word(&symbols, word))
+                .collect::<Option<Vec<_>>>()
+                .map(|words| words.join(" "))
+        })
+        .filter(|phrase| !phrase.is_empty())
+        .collect::<Vec<_>>();
+    (!encoded.is_empty()).then(|| encoded.join("/"))
+}
+
+fn encode_hotword_word(symbols: &[&str], word: &str) -> Option<String> {
+    let normalized = format!("▁{}", word.to_uppercase());
+    let mut paths = vec![None; normalized.len() + 1];
+    paths[0] = Some(Vec::new());
+    for offset in 0..normalized.len() {
+        let Some(path) = paths[offset].clone() else {
+            continue;
+        };
+        for symbol in symbols
+            .iter()
+            .copied()
+            .filter(|symbol| normalized[offset..].starts_with(symbol))
+        {
+            let end = offset + symbol.len();
+            if paths[end].is_none() {
+                let mut next = path.clone();
+                next.push(symbol);
+                paths[end] = Some(next);
+            }
+        }
+    }
+    paths[normalized.len()]
+        .as_ref()
+        .map(|pieces| pieces.join(" "))
+}
+
 #[derive(Clone, Debug)]
 struct WordCorrection {
     tokens: Vec<String>,
@@ -485,7 +553,6 @@ struct WordCorrection {
 #[derive(Clone, Debug, Default)]
 struct WordCorrector {
     entries: Vec<WordCorrection>,
-    hotword_text: Option<String>,
 }
 
 impl WordCorrector {
@@ -518,21 +585,7 @@ impl WordCorrector {
             });
         }
         entries.sort_by(|left, right| right.tokens.len().cmp(&left.tokens.len()));
-        let hotword_text = (!entries.is_empty()).then(|| {
-            entries
-                .iter()
-                .map(|entry| entry.replacement.as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-        });
-        Ok(Self {
-            entries,
-            hotword_text,
-        })
-    }
-
-    fn hotwords(&self) -> Option<&str> {
-        self.hotword_text.as_deref()
+        Ok(Self { entries })
     }
 
     fn apply(&self, text: &str) -> String {
@@ -989,6 +1042,39 @@ mod tests {
         let words = vec!["Voicel".to_owned(), "VOICEL".to_owned()];
         let corrector = WordCorrector::new(&words).expect("valid hotwords");
         assert_eq!(corrector.apply("voicel"), "Voicel");
+    }
+
+    #[test]
+    fn custom_words_are_encoded_as_per_stream_bpe_hotwords() {
+        let symbols = ["▁HELLO", "▁W", "OR", "LD", "▁G", "P", "T"];
+        let words = vec!["GPT".to_owned(), "hello world".to_owned()];
+
+        assert_eq!(
+            encode_hotwords_from_symbols(&symbols, &words).as_deref(),
+            Some("▁G P T/▁HELLO ▁W OR LD")
+        );
+    }
+
+    #[test]
+    fn unsupported_custom_words_skip_native_bias_without_losing_safe_ones() {
+        let symbols = ["▁G", "P", "T"];
+        let words = vec!["unrepresentable".to_owned(), "GPT".to_owned()];
+
+        assert_eq!(
+            encode_hotwords_from_symbols(&symbols, &words).as_deref(),
+            Some("▁G P T")
+        );
+    }
+
+    #[test]
+    fn hotword_encoding_recovers_when_the_longest_prefix_is_a_dead_end() {
+        let symbols = ["▁AB", "▁A", "BC"];
+        let words = vec!["ABC".to_owned()];
+
+        assert_eq!(
+            encode_hotwords_from_symbols(&symbols, &words).as_deref(),
+            Some("▁A BC")
+        );
     }
 
     #[test]
