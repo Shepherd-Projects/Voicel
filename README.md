@@ -2,6 +2,16 @@
 
 Voicel is a local Windows dictation utility built around visible, low-latency transcription. Press one global shortcut to start, press it again to finish and insert, or press the separate cancel shortcut to discard the session.
 
+## Screenshots
+
+### Live dictation
+
+![Voicel's main dictation window](docs/screenshots/voicel-main.png)
+
+### Settings
+
+![Voicel's settings window](docs/screenshots/voicel-settings.png)
+
 ## Why two model modes?
 
 - **Live English** uses sherpa-onnx's online Zipformer recognizer. It is genuinely stateful streaming: audio is decoded as it arrives.
