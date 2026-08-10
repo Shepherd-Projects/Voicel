@@ -136,6 +136,15 @@ impl ModifierShortcutManager {
         snapshot.generation = snapshot.generation.wrapping_add(1);
         snapshot.bindings = bindings;
     }
+
+    pub fn set_cancel(&self, cancel: Option<ModifierChord>) {
+        let mut snapshot = self
+            .snapshot
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        snapshot.generation = snapshot.generation.wrapping_add(1);
+        snapshot.bindings.cancel = cancel;
+    }
 }
 
 impl Drop for ModifierShortcutManager {

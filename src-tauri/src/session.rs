@@ -117,6 +117,25 @@ struct SessionReservation {
     control_receiver: Receiver<SessionCommand>,
 }
 
+struct ActiveCancelShortcut {
+    app: AppHandle,
+}
+
+impl ActiveCancelShortcut {
+    fn register(app: &AppHandle) -> Result<Self, String> {
+        crate::set_cancel_shortcut_active(app, true)?;
+        Ok(Self { app: app.clone() })
+    }
+}
+
+impl Drop for ActiveCancelShortcut {
+    fn drop(&mut self) {
+        if let Err(error) = crate::set_cancel_shortcut_active(&self.app, false) {
+            log::error!("release global cancel shortcut: {error}");
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SessionCommand {
     Stop,
@@ -210,6 +229,10 @@ pub fn start_session(
         Ok(target_window) => target_window,
         Err(error) => return fail_to_start(state, sessions, reservation.id, error),
     };
+    let cancel_shortcut = match ActiveCancelShortcut::register(&app) {
+        Ok(cancel_shortcut) => cancel_shortcut,
+        Err(error) => return fail_to_start(state, sessions, reservation.id, error),
+    };
     if let Err(error) = show_overlay(&app) {
         return fail_to_start(state, sessions, reservation.id, error);
     }
@@ -225,6 +248,7 @@ pub fn start_session(
     let spawn_result = thread::Builder::new()
         .name("voicel-session".to_owned())
         .spawn(move || {
+            let _cancel_shortcut = cancel_shortcut;
             run_session_worker(worker_app.clone(), target_window, control_receiver);
             worker_app.state::<SessionManager>().clear(session_id);
         });

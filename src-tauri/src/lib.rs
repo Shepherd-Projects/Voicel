@@ -24,6 +24,11 @@ use modifier_shortcut::{
     ModifierBindings, ModifierShortcutManager, ParsedShortcut, parse_shortcut, shortcuts_are_equal,
 };
 
+#[derive(Default)]
+struct GlobalShortcutState {
+    registered_cancel: parking_lot::Mutex<Option<ParsedShortcut>>,
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -49,6 +54,7 @@ pub fn run() {
             let start_hidden = state.settings.lock().start_hidden;
             app.manage(state);
             app.manage(SessionManager::new());
+            app.manage(GlobalShortcutState::default());
             let modifier_shortcuts = ModifierShortcutManager::start(app.handle().clone())
                 .map_err(std::io::Error::other)?;
             app.manage(modifier_shortcuts);
@@ -123,10 +129,13 @@ pub(crate) fn register_global_shortcuts(
         return Err("Recording and cancel shortcuts must be different".to_owned());
     }
 
+    let shortcut_state = app.state::<GlobalShortcutState>();
+    let mut registered_cancel = shortcut_state.registered_cancel.lock();
     let shortcuts = app.global_shortcut();
     shortcuts
         .unregister_all()
         .map_err(|error| error.to_string())?;
+    *registered_cancel = None;
 
     if let ParsedShortcut::Standard(toggle) = toggle
         && let Err(error) = shortcuts.on_shortcut(toggle, |app, _, event| {
@@ -137,7 +146,9 @@ pub(crate) fn register_global_shortcuts(
     {
         return Err(format!("Register recording shortcut: {error}"));
     }
-    if let ParsedShortcut::Standard(cancel) = cancel
+    let cancel_active = cancel_shortcut_active(*app.state::<AppState>().phase.lock());
+    if cancel_active
+        && let ParsedShortcut::Standard(cancel) = cancel
         && let Err(error) = shortcuts.on_shortcut(cancel, |app, _, event| {
             if event.state == ShortcutState::Pressed {
                 dispatch_cancel(app.clone());
@@ -151,9 +162,68 @@ pub(crate) fn register_global_shortcuts(
     app.state::<ModifierShortcutManager>()
         .configure(ModifierBindings {
             toggle: toggle.modifier_chord(),
-            cancel: cancel.modifier_chord(),
+            cancel: cancel_active.then(|| cancel.modifier_chord()).flatten(),
         });
+    *registered_cancel = cancel_active.then_some(cancel);
     Ok(())
+}
+
+pub(crate) fn set_cancel_shortcut_active(
+    app: &tauri::AppHandle,
+    active: bool,
+) -> Result<(), String> {
+    let shortcut_state = app.state::<GlobalShortcutState>();
+    let mut registered_cancel = shortcut_state.registered_cancel.lock();
+    if !active {
+        let Some(cancel) = *registered_cancel else {
+            return Ok(());
+        };
+        if let ParsedShortcut::Standard(cancel) = cancel {
+            app.global_shortcut()
+                .unregister(cancel)
+                .map_err(|error| format!("Unregister cancel shortcut: {error}"))?;
+        }
+        app.state::<ModifierShortcutManager>().set_cancel(None);
+        *registered_cancel = None;
+        return Ok(());
+    }
+    if registered_cancel.is_some() {
+        return Ok(());
+    }
+
+    let cancel_hotkey = app
+        .state::<AppState>()
+        .settings
+        .lock()
+        .cancel_hotkey
+        .clone();
+    let cancel = parse_shortcut(&cancel_hotkey, "cancel")?;
+    let shortcuts = app.global_shortcut();
+
+    match cancel {
+        ParsedShortcut::Standard(cancel) => shortcuts
+            .on_shortcut(cancel, |app, _, event| {
+                if event.state == ShortcutState::Pressed {
+                    dispatch_cancel(app.clone());
+                }
+            })
+            .map_err(|error| format!("Register cancel shortcut: {error}"))?,
+        ParsedShortcut::Modifiers(_) => {}
+    }
+
+    app.state::<ModifierShortcutManager>()
+        .set_cancel(cancel.modifier_chord());
+    *registered_cancel = Some(cancel);
+    Ok(())
+}
+
+fn cancel_shortcut_active(phase: app_state::AppPhase) -> bool {
+    matches!(
+        phase,
+        app_state::AppPhase::Loading
+            | app_state::AppPhase::Recording
+            | app_state::AppPhase::Finalizing
+    )
 }
 
 #[cfg(test)]
@@ -176,6 +246,15 @@ mod shortcut_tests {
     #[test]
     fn preserves_default_shortcuts() {
         assert!(validate_global_shortcuts("Ctrl+Shift+Space", "Escape").is_ok());
+    }
+
+    #[test]
+    fn reserves_cancel_shortcut_only_during_an_active_session() {
+        assert!(!cancel_shortcut_active(app_state::AppPhase::Ready));
+        assert!(cancel_shortcut_active(app_state::AppPhase::Loading));
+        assert!(cancel_shortcut_active(app_state::AppPhase::Recording));
+        assert!(cancel_shortcut_active(app_state::AppPhase::Finalizing));
+        assert!(!cancel_shortcut_active(app_state::AppPhase::Error));
     }
 }
 

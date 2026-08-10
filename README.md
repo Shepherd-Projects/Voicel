@@ -21,7 +21,7 @@ Both modes run locally on CPU through one inference runtime. Audio is never uplo
 
 ## Included workflow
 
-- Toggle recording and separate cancel shortcuts; no push-to-talk mode.
+- Toggle recording and a separate cancel shortcut that is reserved only while a session is active; no push-to-talk mode.
 - Non-activating always-on-top recording overlay.
 - Tray operation, start hidden, and launch at Windows sign-in.
 - Immediate model and microphone release after finalization or cancellation.
