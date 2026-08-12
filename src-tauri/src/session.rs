@@ -778,7 +778,35 @@ fn show_overlay(app: &AppHandle) -> Result<(), String> {
         .ok_or_else(|| "Recording overlay window is not available".to_owned())?;
     overlay
         .show()
-        .map_err(|error| format!("Show recording overlay: {error}"))
+        .map_err(|error| format!("Show recording overlay: {error}"))?;
+
+    #[cfg(windows)]
+    reassert_overlay_topmost(&overlay)?;
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn reassert_overlay_topmost(overlay: &tauri::WebviewWindow) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos,
+    };
+
+    let window = overlay
+        .hwnd()
+        .map_err(|error| format!("Get recording overlay window handle: {error}"))?;
+    unsafe {
+        SetWindowPos(
+            window,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+    }
+    .map_err(|error| format!("Restore recording overlay topmost state: {error}"))
 }
 
 fn hide_overlay(app: &AppHandle) -> Result<(), String> {
