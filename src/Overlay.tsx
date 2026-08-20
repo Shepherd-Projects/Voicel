@@ -41,7 +41,7 @@ export default function Overlay() {
     >
       <span className="sr-only" role="status" aria-live="polite">
         {isLoading
-          ? "Hotkey detected. Loading the speech model. Escape cancels."
+          ? "Hotkey detected. Listening now while the speech model loads. Escape cancels."
           : "Recording started. Use the toggle shortcut to finish or Escape to cancel."}
       </span>
       <div className="overlay-signal" aria-hidden="true">
@@ -56,17 +56,17 @@ export default function Overlay() {
       </div>
       <div className="overlay-copy">
         <span>
-          <b>{isLoading ? "PREPARING" : "LISTENING"}</b>
+          <b>LISTENING</b>
           {isLoading ? "MODEL LOADING" : formatElapsed(revision.elapsedMs)}
         </span>
         <p>
           {isLoading
-            ? "Preparing speech recognition…"
+            ? "Listening now while speech recognition prepares…"
             : tail || "Speak when you’re ready…"}
         </p>
       </div>
       <div className="overlay-shortcuts">
-        <span>{isLoading ? "Hotkey detected" : "Toggle to finish"}</span>
+        <span>{isLoading ? "Listening now" : "Toggle to finish"}</span>
         <span>
           <X size={12} /> Esc cancels
         </span>

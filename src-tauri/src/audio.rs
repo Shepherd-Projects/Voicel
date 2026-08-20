@@ -1,4 +1,7 @@
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 
 use anyhow::{Context, Result, bail};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -6,6 +9,9 @@ use cpal::{SampleFormat, Stream, StreamConfig};
 use parking_lot::Mutex;
 
 pub const ENGINE_SAMPLE_RATE: u32 = 16_000;
+// Default Windows input callbacks are ~10 ms after resampling; 256 chunks retain ~2.5 s.
+// A full queue is surfaced as a session failure instead of silently dropping speech.
+const PREBUFFER_CHUNK_CAPACITY: usize = 256;
 
 #[derive(Debug)]
 pub struct AudioChunk {
@@ -13,8 +19,27 @@ pub struct AudioChunk {
     pub input_level: f32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AudioCaptureFailure {
+    PrebufferOverflow,
+    Stream { error: String },
+}
+
+impl fmt::Display for AudioCaptureFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PrebufferOverflow => formatter.write_str("prebuffer overflowed"),
+            Self::Stream { error } => write!(formatter, "stream failed: {error}"),
+        }
+    }
+}
+
 pub struct AudioCapture {
+    // Keeping this stream alive owns the CPAL callback and stops it on drop.
+    #[allow(dead_code)]
     stream: Stream,
+    prebuffer_overflowed: Arc<AtomicBool>,
+    stream_error: Arc<Mutex<Option<String>>>,
 }
 
 impl AudioCapture {
@@ -30,13 +55,17 @@ impl AudioCapture {
         let config: StreamConfig = supported.into();
         let channels = usize::from(config.channels);
         let source_rate = config.sample_rate.0;
-        let (sender, receiver) = mpsc::sync_channel(12);
+        let (sender, receiver) = mpsc::sync_channel(PREBUFFER_CHUNK_CAPACITY);
+        let prebuffer_overflowed = Arc::new(AtomicBool::new(false));
+        let stream_error = Arc::new(Mutex::new(None));
 
         let stream = match sample_format {
             SampleFormat::F32 => build_stream::<f32, _>(
                 &device,
                 &config,
                 sender,
+                Arc::clone(&prebuffer_overflowed),
+                Arc::clone(&stream_error),
                 move |value| value,
                 channels,
                 source_rate,
@@ -45,6 +74,8 @@ impl AudioCapture {
                 &device,
                 &config,
                 sender,
+                Arc::clone(&prebuffer_overflowed),
+                Arc::clone(&stream_error),
                 move |value| value as f32 / i16::MAX as f32,
                 channels,
                 source_rate,
@@ -53,6 +84,8 @@ impl AudioCapture {
                 &device,
                 &config,
                 sender,
+                Arc::clone(&prebuffer_overflowed),
+                Arc::clone(&stream_error),
                 move |value| (value as f32 / u16::MAX as f32) * 2.0 - 1.0,
                 channels,
                 source_rate,
@@ -60,12 +93,24 @@ impl AudioCapture {
             format => bail!("Unsupported microphone sample format: {format:?}"),
         }?;
         stream.play().context("Start microphone capture")?;
-        Ok((Self { stream }, receiver))
+        Ok((
+            Self {
+                stream,
+                prebuffer_overflowed,
+                stream_error,
+            },
+            receiver,
+        ))
     }
 
-    pub fn is_running(&self) -> bool {
-        let _ = &self.stream;
-        true
+    pub fn failure(&self) -> Option<AudioCaptureFailure> {
+        if self.prebuffer_overflowed.load(Ordering::Acquire) {
+            return Some(AudioCaptureFailure::PrebufferOverflow);
+        }
+        self.stream_error
+            .lock()
+            .clone()
+            .map(|error| AudioCaptureFailure::Stream { error })
     }
 }
 
@@ -73,6 +118,8 @@ fn build_stream<T, F>(
     device: &cpal::Device,
     config: &StreamConfig,
     sender: SyncSender<AudioChunk>,
+    prebuffer_overflowed: Arc<AtomicBool>,
+    stream_error: Arc<Mutex<Option<String>>>,
     convert: F,
     channels: usize,
     source_rate: u32,
@@ -93,13 +140,21 @@ where
                 let input_level = rms_level(&mono);
                 let samples = resampler.lock().push(&mono);
                 if !samples.is_empty() {
-                    let _ = sender.try_send(AudioChunk {
+                    match sender.try_send(AudioChunk {
                         samples,
                         input_level,
-                    });
+                    }) {
+                        Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+                        Err(TrySendError::Full(_)) => {
+                            prebuffer_overflowed.store(true, Ordering::Release);
+                        }
+                    }
                 }
             },
-            move |error| log::error!("Microphone stream failed: {error}"),
+            move |error| {
+                log::error!("Microphone stream failed: {error}");
+                *stream_error.lock() = Some(error.to_string());
+            },
             None,
         )
         .context("Open microphone stream")?;

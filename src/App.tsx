@@ -29,7 +29,9 @@ import {
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
+  useRef,
   useState,
   type FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -150,6 +152,11 @@ function matchesShortcut(event: KeyboardEvent, shortcut: string): boolean {
     event.metaKey === parts.includes("meta")
   );
 }
+function findSelectedModel(snapshot: AppSnapshot | null): ModelInfo | undefined {
+  return snapshot?.models.find(
+    (model) => model.id === snapshot.health.selectedModelId,
+  );
+}
 
 export default function App() {
   const adapter = useMemo(() => createVoicelAdapter(), []);
@@ -165,10 +172,14 @@ export default function App() {
     null,
   );
   const [settingsSaving, setSettingsSaving] = useState(false);
-  const selectedModel = snapshot?.models.find(
-    (model) => model.id === snapshot.health.selectedModelId,
-  );
+  const selectedModel = findSelectedModel(snapshot);
   const canRecord = Boolean(selectedModel?.installed);
+  const sessionRef = useRef(session);
+  const snapshotRef = useRef(snapshot);
+  useLayoutEffect(() => {
+    sessionRef.current = session;
+    snapshotRef.current = snapshot;
+  }, [session, snapshot]);
 
   const showNotice = useCallback((next: NoticeState) => setNotice(next), []);
   useEffect(() => {
@@ -219,7 +230,9 @@ export default function App() {
   }, [activeView, adapter, showNotice]);
 
   const startRecording = useCallback(async () => {
-    if (!canRecord) {
+    const currentSnapshot = snapshotRef.current;
+    const currentSelectedModel = findSelectedModel(currentSnapshot);
+    if (!currentSelectedModel?.installed) {
       showNotice({
         tone: "info",
         title: "Choose a model first",
@@ -228,7 +241,8 @@ export default function App() {
       setActiveView("models");
       return;
     }
-    if (["starting", "recording", "stopping"].includes(session.status)) return;
+    if (["starting", "recording", "stopping"].includes(sessionRef.current.status))
+      return;
     setSession({ ...EMPTY_SESSION, status: "starting" });
     try {
       await adapter.startRecording();
@@ -242,7 +256,7 @@ export default function App() {
         body: message,
       });
     }
-  }, [adapter, canRecord, session.status, showNotice]);
+  }, [adapter, showNotice]);
 
   useEffect(() => {
     if (session.status !== "recording") return undefined;
@@ -290,8 +304,10 @@ export default function App() {
   }, [adapter, session.status, showNotice]);
 
   const stopRecording = useCallback(async () => {
-    if (session.status !== "recording") return;
-    const previous = session;
+    const previous = sessionRef.current;
+    if (previous.status !== "recording") return;
+    const currentSnapshot = snapshotRef.current;
+    const selectedModelName = findSelectedModel(currentSnapshot)?.name;
     setSession((current) => ({ ...current, status: "stopping" }));
     try {
       const finalEvent = await adapter.stopRecording();
@@ -304,7 +320,7 @@ export default function App() {
           text,
           createdAt: new Date().toISOString(),
           durationSeconds: Math.max(1, previous.elapsedSeconds),
-          modelName: selectedModel?.name ?? "Unknown model",
+          modelName: selectedModelName ?? "Unknown model",
           source: adapter.mode,
         };
         await adapter.addHistory(item);
@@ -343,11 +359,11 @@ export default function App() {
         body: message,
       });
     }
-  }, [adapter, selectedModel?.name, session, showNotice]);
+  }, [adapter, showNotice]);
 
   const cancelRecording = useCallback(async () => {
-    if (session.status !== "recording" && session.status !== "error") return;
-    const previous = session;
+    const previous = sessionRef.current;
+    if (previous.status !== "recording" && previous.status !== "error") return;
     setSession((current) => ({ ...current, status: "cancelling" }));
     try {
       await adapter.cancelRecording();
@@ -366,15 +382,17 @@ export default function App() {
         body: message,
       });
     }
-  }, [adapter, session, showNotice]);
+  }, [adapter, showNotice]);
   const retryRecording = useCallback(() => {
     setSession(EMPTY_SESSION);
     void startRecording();
   }, [startRecording]);
 
   useEffect(() => {
-    if (adapter.mode !== "demo" || !snapshot) return undefined;
+    if (adapter.mode !== "demo") return undefined;
     const onKeyDown = (event: KeyboardEvent) => {
+      const currentSnapshot = snapshotRef.current;
+      if (!currentSnapshot) return;
       const target = event.target as HTMLElement | null;
       const editing = Boolean(
         target &&
@@ -385,17 +403,18 @@ export default function App() {
       if (
         !editing &&
         !event.repeat &&
-        matchesShortcut(event, snapshot.settings.hotkey)
+        matchesShortcut(event, currentSnapshot.settings.hotkey)
       ) {
         event.preventDefault();
-        if (session.status === "recording") void stopRecording();
+        if (sessionRef.current.status === "recording") void stopRecording();
         else void startRecording();
       }
       if (
         !editing &&
         !event.repeat &&
-        matchesShortcut(event, snapshot.settings.cancelHotkey) &&
-        (session.status === "recording" || session.status === "error")
+        matchesShortcut(event, currentSnapshot.settings.cancelHotkey) &&
+        (sessionRef.current.status === "recording" ||
+          sessionRef.current.status === "error")
       ) {
         event.preventDefault();
         void cancelRecording();
@@ -406,8 +425,6 @@ export default function App() {
   }, [
     adapter.mode,
     cancelRecording,
-    session.status,
-    snapshot,
     startRecording,
     stopRecording,
   ]);
@@ -687,6 +704,7 @@ export default function App() {
                 <ModelsView
                   models={snapshot.models}
                   selectedId={snapshot.health.selectedModelId}
+                  selectedModel={selectedModel}
                   operation={modelOperation}
                   onInstall={(id) => void installModel(id)}
                   onSelect={(id) => void selectModel(id)}
@@ -1464,12 +1482,14 @@ function WordsView({
 function ModelsView({
   models,
   selectedId,
+  selectedModel,
   operation,
   onInstall,
   onSelect,
 }: {
   models: ModelInfo[];
   selectedId: string;
+  selectedModel?: ModelInfo;
   operation: ModelOperation | null;
   onInstall: (id: string) => void;
   onSelect: (id: string) => void;
@@ -1488,7 +1508,7 @@ function ModelsView({
         <div className="model-readout-block">
           <span>Selected model</span>
           <strong>
-            {models.find((model) => model.id === selectedId)?.name ?? "None"}
+            {selectedModel?.name ?? "None"}
           </strong>
         </div>
       </div>

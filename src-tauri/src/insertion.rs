@@ -241,12 +241,12 @@ mod windows_paste {
 
     enum StartDisposition {
         Published,
-        TypeInstead,
+        TypeInstead(String),
     }
 
     enum TransactionStart {
         Published(mpsc::Receiver<Result<(), String>>),
-        TypeInstead,
+        TypeInstead(String),
     }
 
     enum RestoreOutcome {
@@ -256,13 +256,12 @@ mod windows_paste {
     }
 
     pub(super) fn paste(text: String) -> Result<()> {
-        let fallback_text = text.clone();
         match start_transaction(text)? {
             TransactionStart::Published(done) => {
                 send_ctrl_v()?;
                 wait_for_transaction(done)
             }
-            TransactionStart::TypeInstead => super::type_text(&fallback_text),
+            TransactionStart::TypeInstead(text) => super::type_text(&text),
         }
     }
 
@@ -286,7 +285,7 @@ mod windows_paste {
             .map_err(anyhow::Error::msg)?;
         Ok(match disposition {
             StartDisposition::Published => TransactionStart::Published(done_rx),
-            StartDisposition::TypeInstead => TransactionStart::TypeInstead,
+            StartDisposition::TypeInstead(text) => TransactionStart::TypeInstead(text),
         })
     }
 
@@ -309,7 +308,7 @@ mod windows_paste {
         let snapshot = match snapshot_clipboard() {
             Ok(snapshot) => snapshot,
             Err(_) => {
-                let _ = ready.send(Ok(StartDisposition::TypeInstead));
+                let _ = ready.send(Ok(StartDisposition::TypeInstead(text)));
                 return Ok(());
             }
         };
@@ -851,7 +850,7 @@ mod windows_paste {
 
             let done = match start_transaction("Dictated".to_owned())? {
                 TransactionStart::Published(done) => done,
-                TransactionStart::TypeInstead => {
+                TransactionStart::TypeInstead(_) => {
                     bail!("isolated fixture unexpectedly required typing fallback")
                 }
             };
@@ -864,7 +863,7 @@ mod windows_paste {
 
             let done = match start_transaction("Second dictation".to_owned())? {
                 TransactionStart::Published(done) => done,
-                TransactionStart::TypeInstead => {
+                TransactionStart::TypeInstead(_) => {
                     bail!("isolated fixture unexpectedly required typing fallback")
                 }
             };
