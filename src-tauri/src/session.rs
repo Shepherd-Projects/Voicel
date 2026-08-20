@@ -7,7 +7,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::app_state::{AppPhase, AppState, TranscriptState};
-use crate::audio::{AudioCapture, AudioChunk};
+use crate::audio::{AudioCapture, AudioCaptureFailure, AudioChunk};
 use crate::domain::TranscriptSession;
 use crate::engine::{SpeechEngine, TranscriptRevision};
 use crate::insertion::{paste_preserving_clipboard, type_text};
@@ -150,10 +150,70 @@ struct SessionSettings {
 }
 
 struct PreparedSession {
-    engine: SpeechEngine,
-    capture: AudioCapture,
-    audio_receiver: Receiver<AudioChunk>,
+    resources: SessionResources,
     settings: SessionSettings,
+}
+
+struct SessionResources {
+    capture: Option<AudioCapture>,
+    audio_receiver: Option<Receiver<AudioChunk>>,
+    engine: Option<SpeechEngine>,
+}
+
+impl SessionResources {
+    fn from_capture((capture, audio_receiver): (AudioCapture, Receiver<AudioChunk>)) -> Self {
+        Self {
+            capture: Some(capture),
+            audio_receiver: Some(audio_receiver),
+            engine: None,
+        }
+    }
+
+    fn capture(&self) -> &AudioCapture {
+        self.capture
+            .as_ref()
+            .expect("session capture must remain owned")
+    }
+
+    fn audio_receiver(&self) -> &Receiver<AudioChunk> {
+        self.audio_receiver
+            .as_ref()
+            .expect("session audio receiver must remain owned")
+    }
+
+    fn engine_mut(&mut self) -> &mut SpeechEngine {
+        self.engine
+            .as_mut()
+            .expect("session engine must remain loaded")
+    }
+
+    fn set_engine(&mut self, engine: SpeechEngine) {
+        self.engine = Some(engine);
+    }
+
+    // Producer first, receiver second, recognizer last; idempotent for explicit and panic cleanup.
+    fn release(&mut self) {
+        if let Some(capture) = self.capture.take() {
+            drop(capture);
+        }
+        if let Some(audio_receiver) = self.audio_receiver.take() {
+            drop(audio_receiver);
+        }
+        if let Some(engine) = self.engine.take() {
+            engine.unload();
+        }
+    }
+}
+
+impl Drop for SessionResources {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+enum SessionPreparation {
+    Ready(PreparedSession),
+    Cancelled,
 }
 
 #[derive(Clone, Debug)]
@@ -179,6 +239,15 @@ impl Default for TranscriptProgress {
 
 enum RecordingResult {
     Stop(TranscriptProgress),
+    Cancel,
+    Failure {
+        progress: TranscriptProgress,
+        error: String,
+    },
+}
+
+enum SessionFinalization {
+    Stop(StopCompletion),
     Cancel,
     Failure {
         progress: TranscriptProgress,
@@ -281,10 +350,15 @@ fn run_session_worker(
     control_receiver: Receiver<SessionCommand>,
 ) {
     let state = app.state::<AppState>();
-    let preparation =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare_session(&state)));
+    let preparation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        prepare_session(&state, &control_receiver)
+    }));
     let prepared = match preparation {
-        Ok(Ok(prepared)) => prepared,
+        Ok(Ok(SessionPreparation::Ready(prepared))) => prepared,
+        Ok(Ok(SessionPreparation::Cancelled)) => {
+            finish_cancel(&app, &state, target_window);
+            return;
+        }
         Ok(Err(error)) => {
             fail_worker_start(&app, &state, target_window, error);
             return;
@@ -294,7 +368,7 @@ fn run_session_worker(
                 &app,
                 &state,
                 target_window,
-                "Speech model initialization stopped unexpectedly".to_owned(),
+                "Recording preparation stopped unexpectedly".to_owned(),
             );
             return;
         }
@@ -302,17 +376,15 @@ fn run_session_worker(
 
     match control_receiver.try_recv() {
         Ok(SessionCommand::Stop | SessionCommand::Cancel) => {
-            let PreparedSession {
-                engine, capture, ..
-            } = prepared;
-            drop(capture);
-            engine.unload();
+            let PreparedSession { resources, .. } = prepared;
+            drop(resources);
             finish_cancel(&app, &state, target_window);
             return;
         }
         Err(TryRecvError::Empty) => {}
         Err(TryRecvError::Disconnected) => {
-            drop(prepared);
+            let PreparedSession { resources, .. } = prepared;
+            drop(resources);
             fail_worker_start(
                 &app,
                 &state,
@@ -324,30 +396,27 @@ fn run_session_worker(
     }
 
     if let Err(error) = publish_phase(&app, &state, AppPhase::Recording) {
-        drop(prepared);
+        let PreparedSession { resources, .. } = prepared;
+        drop(resources);
         fail_worker_start(&app, &state, target_window, error);
         return;
     }
     if let Err(error) = publish_progress(&app, &state, &TranscriptProgress::default(), false) {
-        drop(prepared);
+        let PreparedSession { resources, .. } = prepared;
+        drop(resources);
         fail_worker_start(&app, &state, target_window, error);
         return;
     }
 
     let PreparedSession {
-        engine,
-        capture,
-        audio_receiver,
+        resources,
         settings,
-        ..
     } = prepared;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_worker(
             app.clone(),
             target_window,
-            engine,
-            capture,
-            audio_receiver,
+            resources,
             control_receiver,
             settings,
         );
@@ -359,7 +428,14 @@ fn run_session_worker(
     }
 }
 
-fn prepare_session(state: &AppState) -> Result<PreparedSession, String> {
+fn prepare_session(
+    state: &AppState,
+    control_receiver: &Receiver<SessionCommand>,
+) -> Result<SessionPreparation, String> {
+    if loading_command_requested(control_receiver)? {
+        return Ok(SessionPreparation::Cancelled);
+    }
+
     let settings = state.settings.lock().clone();
     let spec = state
         .model_store
@@ -369,18 +445,68 @@ fn prepare_session(state: &AppState) -> Result<PreparedSession, String> {
         return Err(format!("Install {} before recording", spec.name));
     }
 
-    let model_directory = state.model_store.model_path(spec);
-    let engine = SpeechEngine::load(spec, model_directory, &settings.custom_words)
-        .map_err(|error| format!("Load model '{}': {error}", spec.name))?;
-    let (capture, audio_receiver) =
-        AudioCapture::start().map_err(|error| format!("Start microphone capture: {error}"))?;
+    if loading_command_requested(control_receiver)? {
+        return Ok(SessionPreparation::Cancelled);
+    }
 
-    Ok(PreparedSession {
-        engine,
-        capture,
-        audio_receiver,
-        settings: session_settings(spec, &settings),
-    })
+    let mut resources = SessionResources::from_capture(
+        AudioCapture::start().map_err(|error| format!("Start microphone capture: {error}"))?,
+    );
+
+    match loading_command_requested(control_receiver) {
+        Ok(true) => {
+            return Ok(SessionPreparation::Cancelled);
+        }
+        Ok(false) => {}
+        Err(error) => {
+            return Err(error);
+        }
+    }
+    if let Some(failure) = resources.capture().failure() {
+        let error = capture_failure_message(failure, "while the speech model was loading");
+        return Err(error);
+    }
+
+    let model_directory = state.model_store.model_path(spec);
+    let engine = match SpeechEngine::load(spec, model_directory, &settings.custom_words) {
+        Ok(engine) => engine,
+        Err(error) => return Err(format!("Load model '{}': {error}", spec.name)),
+    };
+    resources.set_engine(engine);
+
+    match loading_command_requested(control_receiver) {
+        Ok(true) => {
+            return Ok(SessionPreparation::Cancelled);
+        }
+        Ok(false) => {}
+        Err(error) => {
+            return Err(error);
+        }
+    }
+    if let Some(failure) = resources.capture().failure() {
+        let error = capture_failure_message(failure, "while the speech model was loading");
+        return Err(error);
+    }
+
+    let settings = session_settings(spec, &settings);
+    Ok(SessionPreparation::Ready(PreparedSession {
+        resources,
+        settings,
+    }))
+}
+
+fn capture_failure_message(failure: AudioCaptureFailure, phase: &str) -> String {
+    format!("Microphone {failure} {phase}")
+}
+
+fn loading_command_requested(control_receiver: &Receiver<SessionCommand>) -> Result<bool, String> {
+    match control_receiver.try_recv() {
+        Ok(SessionCommand::Stop | SessionCommand::Cancel) => Ok(true),
+        Err(TryRecvError::Empty) => Ok(false),
+        Err(TryRecvError::Disconnected) => {
+            Err("Recording control channel closed while loading".to_owned())
+        }
+    }
 }
 
 fn fail_worker_start(
@@ -410,49 +536,46 @@ fn session_settings(spec: &ModelSpec, settings: &Settings) -> SessionSettings {
 fn run_worker(
     app: AppHandle,
     target_window: ForegroundWindow,
-    mut engine: SpeechEngine,
-    capture: AudioCapture,
-    audio_receiver: Receiver<AudioChunk>,
+    mut resources: SessionResources,
     control_receiver: Receiver<SessionCommand>,
     settings: SessionSettings,
 ) {
     let state = app.state::<AppState>();
-    let recording =
-        record_until_control(&app, &state, &mut engine, audio_receiver, control_receiver);
-    drop(capture);
-
-    match recording {
-        RecordingResult::Cancel => {
-            engine.unload();
-            finish_cancel(&app, &state, target_window);
-        }
+    let recording = record_until_control(&app, &state, &mut resources, control_receiver);
+    let finalization = match recording {
+        RecordingResult::Cancel => SessionFinalization::Cancel,
         RecordingResult::Stop(progress) => {
-            let completion = finish_stop(&app, &state, &mut engine, progress);
-            engine.unload();
-            finish_stop_after_unload(&app, &state, target_window, settings, completion);
+            SessionFinalization::Stop(finish_stop(&app, &state, resources.engine_mut(), progress))
         }
         RecordingResult::Failure { progress, error } => {
-            engine.unload();
-            finish_failure(
-                &app,
-                &state,
-                target_window,
-                settings,
-                StopCompletion {
-                    progress,
-                    errors: vec![error],
-                    finalization_failed: true,
-                },
-            );
+            SessionFinalization::Failure { progress, error }
         }
+    };
+    drop(resources);
+
+    match finalization {
+        SessionFinalization::Cancel => finish_cancel(&app, &state, target_window),
+        SessionFinalization::Stop(completion) => {
+            finish_stop_after_unload(&app, &state, target_window, settings, completion);
+        }
+        SessionFinalization::Failure { progress, error } => finish_failure(
+            &app,
+            &state,
+            target_window,
+            settings,
+            StopCompletion {
+                progress,
+                errors: vec![error],
+                finalization_failed: true,
+            },
+        ),
     }
 }
 
 fn record_until_control(
     app: &AppHandle,
     state: &AppState,
-    engine: &mut SpeechEngine,
-    audio_receiver: Receiver<AudioChunk>,
+    resources: &mut SessionResources,
     control_receiver: Receiver<SessionCommand>,
 ) -> RecordingResult {
     let started = Instant::now();
@@ -472,14 +595,24 @@ fn record_until_control(
             }
         }
 
-        match audio_receiver.recv_timeout(CONTROL_POLL_INTERVAL) {
+        if let Some(failure) = resources.capture().failure() {
+            return RecordingResult::Failure {
+                progress,
+                error: capture_failure_message(failure, "during recording"),
+            };
+        }
+
+        let audio_result = resources
+            .audio_receiver()
+            .recv_timeout(CONTROL_POLL_INTERVAL);
+        match audio_result {
             Ok(AudioChunk {
                 samples,
                 input_level,
             }) => {
                 progress.elapsed_ms = elapsed_ms(started);
                 progress.input_level = input_level.clamp(0.0, 1.0);
-                match engine.push(&samples) {
+                match resources.engine_mut().push(&samples) {
                     Ok(Some(revision)) => apply_engine_revision(&mut progress, revision),
                     Ok(None) => progress.revision = progress.revision.saturating_add(1),
                     Err(error) => {
@@ -930,5 +1063,25 @@ mod tests {
             ..TranscriptProgress::default()
         };
         assert_eq!(transcript_text(&progress), "a stable sentence and its tail");
+    }
+
+    #[test]
+    fn capture_failure_messages_keep_phase_and_device_cause() {
+        assert_eq!(
+            capture_failure_message(
+                AudioCaptureFailure::PrebufferOverflow,
+                "while the speech model was loading"
+            ),
+            "Microphone prebuffer overflowed while the speech model was loading"
+        );
+        assert_eq!(
+            capture_failure_message(
+                AudioCaptureFailure::Stream {
+                    error: "device removed".to_owned(),
+                },
+                "during recording"
+            ),
+            "Microphone stream failed: device removed during recording"
+        );
     }
 }
